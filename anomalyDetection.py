@@ -50,6 +50,9 @@ LSH_BUCKET      = float(os.getenv("LSH_BUCKET", "1.0"))
 LSH_THRESH      = float(os.getenv("LSH_THRESH", "1.5"))
 MAX_GROUP_ROWS  = int(os.getenv("MAX_GROUP_ROWS", "250000")) # cap group size for LSH path
 
+# Console print cap
+PRINT_LIMIT     = int(os.getenv("PRINT_LIMIT", "100"))
+
 spark = (
     SparkSession.builder
     .appName("ClassifyTemps")
@@ -96,18 +99,19 @@ scored = (
 outliers_z = (
     scored
     .filter((F.col("n") >= MIN_POINTS) & (F.col("abs_z") > F.lit(Z_THRESH)))
-    .select(SYS_COL, TS_COL, FEATURE_COL, "z")
+    .select(SYS_COL, TS_COL, FEATURE_COL, "z", "abs_z")
 )
 
 # Always surface the strongest candidates
 suspects_topk = (
     scored
     .orderBy(F.desc("abs_z"))
-    .select(SYS_COL, TS_COL, FEATURE_COL, "z")
+    .select(SYS_COL, TS_COL, FEATURE_COL, "z", "abs_z")
     .limit(TOPK)
 )
 
 # ---- ROBUST IQR OUTLIERS (per system) ----
+# q1, q3 are per-system; we compute thresholds and expose detailed outliers
 iqr_stats = df.groupBy(SYS_COL).agg(
     F.expr(f"percentile_approx({FEATURE_COL}, 0.25)").alias("q1"),
     F.expr(f"percentile_approx({FEATURE_COL}, 0.75)").alias("q3"),
@@ -118,8 +122,41 @@ with_iqr = (
       .withColumn("low",  F.col("q1") - 1.5 * F.col("iqr"))
       .withColumn("high", F.col("q3") + 1.5 * F.col("iqr"))
 )
-outliers_iqr = with_iqr.filter((F.col(FEATURE_COL) < F.col("low")) | (F.col(FEATURE_COL) > F.col("high"))) \
-                       .select(SYS_COL, TS_COL, FEATURE_COL)
+
+# Per-system IQR thresholds table (unique per system)
+iqr_bounds = (
+    with_iqr.groupBy(SYS_COL)
+    .agg(
+        F.first("q1").alias("q1"),
+        F.first("q3").alias("q3"),
+        F.first("iqr").alias("iqr"),
+        F.first("low").alias("low"),
+        F.first("high").alias("high"),
+        F.count("*").alias("n"),
+        F.sum(
+            F.when((F.col(FEATURE_COL) < F.col("low")) | (F.col(FEATURE_COL) > F.col("high")), 1).otherwise(0)
+        ).alias("n_outliers")
+    )
+)
+
+# Detailed IQR outliers table (every row that violates low/high)
+outliers_iqr_detailed = (
+    with_iqr
+    .withColumn(
+        "where",
+        F.when(F.col(FEATURE_COL) < F.col("low"), F.lit("below_low")).otherwise(F.lit("above_high"))
+    )
+    .withColumn(
+        "dist_from_bound",
+        F.when(F.col(FEATURE_COL) < F.col("low"), F.col("low") - F.col(FEATURE_COL))
+         .otherwise(F.col(FEATURE_COL) - F.col("high"))
+    )
+    .filter((F.col(FEATURE_COL) < F.col("low")) | (F.col(FEATURE_COL) > F.col("high")))
+    .select(SYS_COL, TS_COL, FEATURE_COL, "q1", "q3", "iqr", "low", "high", "where", "dist_from_bound")
+)
+
+# For parity, keep the simple/compact IQR output as well
+outliers_iqr = outliers_iqr_detailed.select(SYS_COL, TS_COL, FEATURE_COL)
 
 # =======================
 #    K-MEANS ANOMALIES
@@ -136,7 +173,7 @@ km_model = km_pipe.fit(km_input)
 centers = km_model.stages[-1].clusterCenters()
 def dist_to_center(feat, cid):
     c = centers[cid]
-    from math import sqrt  # noqa: F401 (used implicitly by Vectors.squared_distance exponent)
+    from math import sqrt  # noqa: F401
     return float(Vectors.squared_distance(feat, c)) ** 0.5
 dist_udf = F.udf(dist_to_center, DoubleType())
 
@@ -250,7 +287,8 @@ else:
 # ---- OUTPUT ----
 base = (Path.cwd() / OUT_DIR).resolve()
 for sub in ["temp_outliers_zscore", "temp_suspects_topk", "temp_outliers_iqr",
-            "temp_outliers_kmeans", "temp_outliers_knn"]:
+            "temp_outliers_kmeans", "temp_outliers_knn",
+            "iqr_bounds", "iqr_outliers_detailed"]:
     (base / sub).mkdir(parents=True, exist_ok=True)
 
 # Keep writers modest to avoid memory spikes; adjust to taste
@@ -260,11 +298,28 @@ outliers_iqr.coalesce(1).write.mode("overwrite").parquet((base / "temp_outliers_
 outliers_kmeans.coalesce(1).write.mode("overwrite").parquet((base / "temp_outliers_kmeans").as_posix())
 outliers_knn.coalesce(1).write.mode("overwrite").parquet((base / "temp_outliers_knn").as_posix())
 
+# NEW: write the IQR tables
+iqr_bounds.coalesce(1).write.mode("overwrite").parquet((base / "iqr_bounds").as_posix())
+outliers_iqr_detailed.coalesce(1).write.mode("overwrite").parquet((base / "iqr_outliers_detailed").as_posix())
+
 # ---- CONSOLE QUICKLOOK ----
 print("rows:", df.count(), "systems:", df.select(SYS_COL).distinct().count())
 print(f"feature: {FEATURE_COL}, z-threshold: {Z_THRESH}, min points per system: {MIN_POINTS}")
+
+print("\n--- KMeans (top by distance) ---")
 km_scored.orderBy(F.desc("km_dist")).select(SYS_COL, TS_COL, FEATURE_COL,
-                                            "z","cluster","km_dist").show(100, truncate=False)
-outliers_knn.orderBy(F.desc("knn_dist")).show(100, truncate=False)
+                                            "z","cluster","km_dist").show(PRINT_LIMIT, truncate=False)
+
+print("\n--- KNN outliers (top by knn_dist) ---")
+outliers_knn.orderBy(F.desc("knn_dist")).show(PRINT_LIMIT, truncate=False)
+
+print("\n=== IQR thresholds per system ===")
+iqr_bounds.orderBy(SYS_COL).show(PRINT_LIMIT, truncate=False)
+
+print("\n=== IQR outliers (with thresholds) ===")
+outliers_iqr_detailed.orderBy(F.desc("dist_from_bound")).show(PRINT_LIMIT, truncate=False)
+
+print("\n--- Top z-score outliers ---")
+outliers_z.orderBy(F.desc("abs_z")).show(PRINT_LIMIT, truncate=False)
 
 spark.stop()
