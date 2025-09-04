@@ -72,6 +72,7 @@ cmd=(
   "${SPARK_HOME}/bin/spark-submit"
   --class org.apache.spark.sql.hive.thriftserver.HiveThriftServer2
   --jars "${SPARK_HOME}/jars/iceberg-spark-runtime-3.4_2.12-1.9.2.jar,${SPARK_HOME}/jars/iceberg-core-1.9.2.jar"
+  --packages "com.github.ben-manes.caffeine:caffeine:2.9.3"
   --master "${SPARK_MASTER}"
   --driver-memory "${SPARK_DRIVER_MEMORY}"
   --conf "spark.driver.memoryOverhead=${SPARK_DRIVER_OVERHEAD}"

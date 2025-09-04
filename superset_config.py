@@ -26,6 +26,16 @@ DATABASES = {
     }
 }
 
+# --- make charts/dashboards wait longer before showing the 60s warning ---
+SUPERSET_WEBSERVER_TIMEOUT = 60000  # seconds (e.g., 10 minutes)
+
+# --- SQL Lab: sync + async limits ---
+# Sync SQL Lab queries (when not using Celery). Still constrained by the webserver/proxy:
+SQLLAB_TIMEOUT = 60000  # seconds
+
+# If/when you enable async SQL Lab (Celery), allow long-running queries:
+SQLLAB_ASYNC_TIME_LIMIT_SEC = 60 * 60 * 6  # 6 hours
+
 # --- Spark/Hive: rewrite unsupported SHOW CREATE VIEW to SHOW CREATE TABLE ---
 from sqlalchemy import event
 from sqlalchemy.engine import Engine
